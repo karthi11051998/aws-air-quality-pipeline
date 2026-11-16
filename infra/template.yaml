@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Air quality and weather batch pipeline (Open-Meteo -> S3 -> Athena)
+
+Parameters:
+  PandasLayerArn:
+    Type: String
+    Description: ARN of the AWS SDK for pandas managed layer (Python 3.12) in this region
+    Default: arn:aws:lambda:ap-south-2:246107603503:layer:AWSSDKPandas-Python312:28
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Turn the 3-hourly ingest schedule on or off
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    MemorySize: 256
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "aqp-data-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: aqp-alerts
+      DisplayName: AQP pipeline alerts
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: aqp-dlq
+      MessageRetentionPeriod: 1209600
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: aqp-ingest
+      CodeUri: ../src/
+      Handler: ingest.app.handler
+      Timeout: 120
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataBucket
+          RAW_PREFIX: raw
+          TIMEZONE: Asia/Kolkata
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${DataBucket.Arn}/raw/*"
+      Events:
+        EveryThreeHours:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: cron(0 0/3 * * ? *)
+            ScheduleExpressionTimezone: Asia/Kolkata
+            State: !Ref ScheduleState
+            Name: aqp-ingest-every-3h
+
+  TransformFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: aqp-transform
+      CodeUri: ../src/
+      Handler: transform.app.handler
+      MemorySize: 512
+      Timeout: 60
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Layers:
+        - !Ref PandasLayerArn
+      Environment:
+        Variables:
+          CURATED_PREFIX: curated
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::aqp-data-${AWS::AccountId}-${AWS::Region}/raw/*"
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:AbortMultipartUpload
+              Resource: !Sub "arn:aws:s3:::aqp-data-${AWS::AccountId}-${AWS::Region}/curated/*"
+      Events:
+        RawFileCreated:
+          Type: S3
+          Properties:
+            Bucket: !Ref DataBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+                  - Name: suffix
+                    Value: .json
+
+  IngestErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: aqp-ingest-errors
+      AlarmDescription: The ingest Lambda reported at least one error
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  TransformErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: aqp-transform-errors
+      AlarmDescription: The transform Lambda reported at least one error
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransformFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: aqp-dlq-not-empty
+      AlarmDescription: A failed event is waiting in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: aqp_db
+        Description: Curated air quality and weather tables
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: aqp-workgroup
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataBucket}/athena-results/"
+
+Outputs:
+  BucketName:
+    Value: !Ref DataBucket
+  IngestFunctionName:
+    Value: !Ref IngestFunction
+  TransformFunctionName:
+    Value: !Ref TransformFunction
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue
