@@ -68,7 +68,6 @@ flowchart LR
 
 **Flow in one paragraph:** a run of `aqp-ingest` (scheduled or manual) calls both Open-Meteo APIs for each of 8 cities and writes the untouched JSON to `raw/`. Every new raw file triggers `aqp-transform` through an S3 event. The transform flattens the data to one row per city per hour, enforces types, removes forecast hours, adds an AQI category and writes Parquet to `curated/`. Athena reads the Parquet through Glue tables with partition projection, and a set of layered SQL views deduplicates the data and answers the business questions.
 
-*(Add `docs/architecture.png` here if you export a diagram image.)*
 
 ---
 
@@ -420,4 +419,4 @@ Weather and air quality data are provided by [Open-Meteo.com](https://open-meteo
 
 ## Author
 
-**Your Name** | [LinkedIn](https://www.linkedin.com/in/your-profile) | [GitHub](https://github.com/your-username)
+**Karthikeyan Subramani** | [LinkedIn](www.linkedin.com/in/karthikeyan110598)
